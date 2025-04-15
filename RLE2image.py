@@ -1,84 +1,81 @@
 import cv2
 import numpy as np
-import math
-
-# import zigzag functions
-from zigzag import *
-
-QUANTIZATION_MAT = np.array([[16,11,10,16,24,40,51,61],[12,12,14,19,26,58,60,55],[14,13,16,24,40,57,69,56 ],[14,17,22,29,51,87,80,62],[18,22,37,56,68,109,103,77],[24,35,55,64,81,104,113,92],[49,64,78,87,103,121,120,101],[72,92,95,98,112,100,103,99]])
-
-# defining block size
-block_size = 8
-
-# Reading image.txt to decode it as image
-with open('image.txt', 'r') as myfile:
-    image=myfile.read()
-
-# spplits into tokens seperated by space characters
-details = image.split()
-
-# just python-crap to get integer from tokens : h and w are height and width of image (first two items)
-h = int(''.join(filter(str.isdigit, details[0])))
-w = int(''.join(filter(str.isdigit, details[1])))
-
-# declare an array of zeros (It helps to reconstruct bigger array on which IDCT and all has to be applied)
-array = np.zeros(h*w).astype(int)
+from scipy.fftpack import idct
+from zigzag import inverse_zigzag
+import argparse
 
 
-# some loop var initialisation
-k = 0
-i = 2
-x = 0
-j = 0
+def upsample(channel, h, w):
+    return cv2.resize(channel, (w, h), interpolation=cv2.INTER_LINEAR)
 
+def ycbcr_to_rgb(img):
+    return cv2.cvtColor(img, cv2.COLOR_YCrCb2RGB)
 
-# This loop gives us reconstructed array of size of image
+def get_quant_matrix(quality):
+    Q50 = np.array([[16,11,10,16,24,40,51,61],
+                    [12,12,14,19,26,58,60,55],
+                    [14,13,16,24,40,57,69,56],
+                    [14,17,22,29,51,87,80,62],
+                    [18,22,37,56,68,109,103,77],
+                    [24,35,55,64,81,104,113,92],
+                    [49,64,78,87,103,121,120,101],
+                    [72,92,95,98,112,100,103,99]])
 
-while k < array.shape[0]:
-# Oh! image has ended
-    if(details[i] == ';'):
-        break
-# This is imp! note that to get negative numbers in array check for - sign in string
-    if "-" not in details[i]:
-        array[k] = int(''.join(filter(str.isdigit, details[i])))        
+    if quality < 50 and quality > 1:
+        scale = 5000 / quality
+    elif quality < 100:
+        scale = 200 - 2 * quality
     else:
-        array[k] = -1*int(''.join(filter(str.isdigit, details[i])))        
+        scale = 1
 
-    if(i+3 < len(details)):
-        j = int(''.join(filter(str.isdigit, details[i+3])))
+    Q = np.floor((Q50 * scale + 50) / 100)
+    Q[Q == 0] = 1
+    return Q
 
-    if j == 0:
-        k = k + 1
-    else:                
-        k = k + j + 1        
 
-    i = i + 2
+def block_reconstruct(blocks, h, w, Q):
+    channel = np.zeros((h, w))
+    idx = 0
+    for i in range(0, h, 8):
+        for j in range(0, w, 8):
+            block = inverse_zigzag(blocks[idx], 8, 8)
+            dequant = block * Q
+            idct_block = idct(idct(dequant.T, norm='ortho').T, norm='ortho')
+            channel[i:i+8, j:j+8] = idct_block + 128
+            idx += 1
+    return np.clip(channel, 0, 255).astype(np.uint8)
 
-array = np.reshape(array,(h,w))
 
-# loop for constructing intensity matrix form frequency matrix (IDCT and all)
-i = 0
-j = 0
-k = 0
+def decode_image(filepath):
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
 
-# initialisation of compressed image
-padded_img = np.zeros((h,w))
+    h, w, quality = map(int, lines[0].strip().split(","))
+    blocks_raw = [list(map(int, line.strip().split(","))) for line in lines[1:]]
 
-while i < h:
-    j = 0
-    while j < w:        
-        temp_stream = array[i:i+8,j:j+8]                
-        block = inverse_zigzag(temp_stream.flatten(), int(block_size),int(block_size))            
-        de_quantized = np.multiply(block,QUANTIZATION_MAT)                
-        padded_img[i:i+8,j:j+8] = cv2.idct(de_quantized)        
-        j = j + 8        
-    i = i + 8
+    Q = get_quant_matrix(quality)
 
-# clamping to  8-bit max-min values
-padded_img[padded_img > 255] = 255
-padded_img[padded_img < 0] = 0
+    y_blocks = blocks_raw[:(h//8)*(w//8)]
+    cb_blocks = blocks_raw[(h//8)*(w//8):(h//8)*(w//8)//4*5]  # 1/4 dimensiune cb+cr
+    cr_blocks = blocks_raw[(h//8)*(w//8)//4*5:]
 
-# compressed image is written into compressed_image.mp file
-cv2.imwrite("compressed_image.bmp",np.uint8(padded_img))
+    Y = block_reconstruct(y_blocks, h, w, Q)
+    Cb = block_reconstruct(cb_blocks, h//2, w//2, Q)
+    Cr = block_reconstruct(cr_blocks, h//2, w//2, Q)
 
-# DONE!
+    Cb_up = upsample(Cb, h, w)
+    Cr_up = upsample(Cr, h, w)
+
+    img_ycbcr = cv2.merge([Y, Cb_up, Cr_up])
+    img_rgb = ycbcr_to_rgb(img_ycbcr)
+
+    cv2.imwrite("decompressed_image.png", cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+    print("Image reconstructed and saved as decompressed_image.png")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Decode image from DCT-compressed text")
+    parser.add_argument("--input", type=str, required=True, help="Path to compressed image text")
+    args = parser.parse_args()
+
+    decode_image(args.input)
