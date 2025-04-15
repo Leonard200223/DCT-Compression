@@ -1,141 +1,97 @@
 import cv2
 import numpy as np
-import math
+from scipy.fftpack import dct, idct
+from zigzag import zigzag, inverse_zigzag
+import argparse
 
-# import zigzag functions
-from zigzag import *
+# =============================
+# === CONFIGURABLE PARAMS ====
+# =============================
+def get_quant_matrix(quality):
+    Q50 = np.array([[16,11,10,16,24,40,51,61],
+                    [12,12,14,19,26,58,60,55],
+                    [14,13,16,24,40,57,69,56],
+                    [14,17,22,29,51,87,80,62],
+                    [18,22,37,56,68,109,103,77],
+                    [24,35,55,64,81,104,113,92],
+                    [49,64,78,87,103,121,120,101],
+                    [72,92,95,98,112,100,103,99]])
 
+    if quality < 50 and quality > 1:
+        scale = 5000 / quality
+    elif quality < 100:
+        scale = 200 - 2 * quality
+    else:
+        scale = 1
 
-def get_run_length_encoding(image):
-    i = 0
-    skip = 0
-    stream = []    
-    bitstream = ""
-    image = image.astype(int)
-    while i < image.shape[0]:
-        if image[i] != 0:            
-            stream.append((image[i],skip))
-            bitstream = bitstream + str(image[i])+ " " +str(skip)+ " "
-            skip = 0
-        else:
-            skip = skip + 1
-        i = i + 1
+    Q = np.floor((Q50 * scale + 50) / 100)
+    Q[Q == 0] = 1
+    return Q
 
-    return bitstream
+# =============================
+# === IMAGE UTILITIES ========
+# =============================
+def rgb_to_ycbcr(img):
+    return cv2.cvtColor(img, cv2.COLOR_RGB2YCrCb)
 
-# defining block size
-block_size = 8
+def ycbcr_to_rgb(img):
+    return cv2.cvtColor(img, cv2.COLOR_YCrCb2RGB)
 
-# Quantization Matrix 
-QUANTIZATION_MAT = np.array([[16,11,10,16,24,40,51,61],[12,12,14,19,26,58,60,55],[14,13,16,24,40,57,69,56 ],[14,17,22,29,51,87,80,62],[18,22,37,56,68,109,103,77],[24,35,55,64,81,104,113,92],[49,64,78,87,103,121,120,101],[72,92,95,98,112,100,103,99]])
+def downsample(channel):
+    return channel[::2, ::2]
 
-# reading image in grayscale style
-img = cv2.imread('harry.jpg', cv2.IMREAD_GRAYSCALE)
+# =============================
+# === DCT AND BLOCK HANDLING =
+# =============================
+def block_process(channel, Q):
+    h, w = channel.shape
+    h8 = h - h % 8
+    w8 = w - w % 8
+    channel = channel[:h8, :w8]
 
-#You can try with this matrix to understand working of DCT
-#img = np.array([[255,255,227,204,204,203,192,217],[215,189,167,166,160,135,167,244],[169,115,99,99,99,82,127,220],[146,90,86,88,84,63,195,189],[255,255,231,239,240,182,251,232],[255,255,21,245,226,169,229,247],[255,255,222,251,174,209,174,163],[255,255,221,184,205,248,249,220]])
+    blocks = []
+    for i in range(0, h8, 8):
+        for j in range(0, w8, 8):
+            block = channel[i:i+8, j:j+8] - 128
+            dct_block = dct(dct(block.T, norm='ortho').T, norm='ortho')
+            quant_block = np.round(dct_block / Q)
+            zz = zigzag(quant_block)
+            blocks.append(zz)
+    return blocks, h8, w8
 
-
-# get size of the image
-[h , w] = img.shape
-
-
-
-# No of blocks needed : Calculation
-
-height = h
-width = w
-h = np.float32(h) 
-w = np.float32(w) 
-
-nbh = math.ceil(h/block_size)
-nbh = np.int32(nbh)
-
-nbw = math.ceil(w/block_size)
-nbw = np.int32(nbw)
-
-
-# Pad the image, because sometime image size is not dividable to block size
-# get the size of padded image by multiplying block size by number of blocks in height/width
-
-# height of padded image
-H =  block_size * nbh
-
-# width of padded image
-W =  block_size * nbw
-
-# create a numpy zero matrix with size of H,W
-padded_img = np.zeros((H,W))
-
-# copy the values of img into padded_img[0:h,0:w]
-# for i in range(height):
-#         for j in range(width):
-#                 pixel = img[i,j]
-#                 padded_img[i,j] = pixel
-
-# or this other way here
-padded_img[0:height,0:width] = img[0:height,0:width]
-
-cv2.imwrite('uncompressed.bmp', np.uint8(padded_img))
-
-
-
-# start encoding:
-# divide image into block size by block size (here: 8-by-8) blocks
-# To each block apply 2D discrete cosine transform
-# reorder DCT coefficients in zig-zag order
-# reshaped it back to block size by block size (here: 8-by-8)
-
-for i in range(nbh):
+# =============================
+# === MAIN ENCODER ===========
+# =============================
+def encode_image(image_path, quality):
+    img = cv2.imread(image_path)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img_ycbcr = rgb_to_ycbcr(img)
     
-        # Compute start and end row index of the block
-        row_ind_1 = i*block_size                
-        row_ind_2 = row_ind_1+block_size
-        
-        for j in range(nbw):
-            
-            # Compute start & end column index of the block
-            col_ind_1 = j*block_size                       
-            col_ind_2 = col_ind_1+block_size
-                        
-            block = padded_img[ row_ind_1 : row_ind_2 , col_ind_1 : col_ind_2 ]
-                       
-            # apply 2D discrete cosine transform to the selected block                       
-            DCT = cv2.dct(block)            
+    Y, Cb, Cr = cv2.split(img_ycbcr)
+    Cb_down = downsample(Cb)
+    Cr_down = downsample(Cr)
 
-            DCT_normalized = np.divide(DCT,QUANTIZATION_MAT).astype(int)            
-            
-            # reorder DCT coefficients in zig zag order by calling zigzag function
-            # it will give you a one dimentional array
-            reordered = zigzag(DCT_normalized)
+    Q = get_quant_matrix(quality)
 
-            # reshape the reorderd array back to (block size by block size) (here: 8-by-8)
-            reshaped= np.reshape(reordered, (block_size, block_size)) 
-            
-            # copy reshaped matrix into padded_img on current block corresponding indices
-            padded_img[row_ind_1 : row_ind_2 , col_ind_1 : col_ind_2] = reshaped                        
+    Y_blocks, h, w = block_process(Y, Q)
+    Cb_blocks, _, _ = block_process(Cb_down, Q)
+    Cr_blocks, _, _ = block_process(Cr_down, Q)
 
-cv2.imshow('encoded image', np.uint8(padded_img))
+    print(f"Image encoded with {len(Y_blocks)} Y blocks, {len(Cb_blocks)} Cb, {len(Cr_blocks)} Cr")
 
-arranged = padded_img.flatten()
+    # Write to file (simplified format)
+    with open("compressed_image.txt", "w") as f:
+        f.write(f"{h},{w},{quality}\n")
+        for block in Y_blocks + Cb_blocks + Cr_blocks:
+            f.write(",".join(map(str, block)) + "\n")
 
-# Now RLE encoded data is written to a text file (You can check no of bytes in text file is very less than no of bytes in the image
-# THIS IS COMPRESSION WE WANTED, NOTE THAT ITS JUST COMPRESSION DUE TO RLE, YOU CAN COMPRESS IT FURTHER USING HUFFMAN CODES OR MAY BE 
-# REDUCING MORE FREQUENCY COEFFICIENTS TO ZERO)
+# =============================
+# === CLI ====================
+# =============================
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Image compression using DCT and quantization")
+    parser.add_argument("--input", type=str, required=True, help="Input image path")
+    parser.add_argument("--quality", type=int, default=50, help="Quality factor (1-100)")
+    args = parser.parse_args()
 
-bitstream = get_run_length_encoding(arranged)
-
-# Two terms are assigned for size as well, semicolon denotes end of image to reciever
-bitstream = str(padded_img.shape[0]) + " " + str(padded_img.shape[1]) + " " + bitstream + ";"
-
-# Written to image.txt
-file1 = open("image.txt","w")
-file1.write(bitstream)
-file1.close()
-
-cv2.waitKey(0)
-cv2.destroyAllWindows()
-
-
-
-
+    encode_image(args.input, args.quality)
